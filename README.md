@@ -2,6 +2,8 @@
 
 Package `redef` scans Go code and identifies unnecessary redefinitions of variables within functions and methods.
 
+## Synopsis
+
 For example, consider the following pseudocode:
 
 ```go
@@ -22,6 +24,10 @@ func myFunction() {
 As you can see, I needlessly redefined -- or "shadowed" -- my `err` instance inside `myFunction`.
 
 This tool looks for, and reports on, such flaws.
+
+## Status
+
+This package is **highly experimental**, and a few quirks still need to be worked out. Use with caution.
 
 ## Building
 
