@@ -22,160 +22,192 @@ var Analyzer = &analysis.Analyzer{
 
 func run(pass *analysis.Pass) (interface{}, error) {
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+	parent := buildParentMap(insp)
 
-	// Build parent map
-	parent := make(map[ast.Node]ast.Node)
-	insp.Nodes(nil, func(n ast.Node, push bool) bool {
-		if !push {
-			return true
-		}
-		ast.Inspect(n, func(child ast.Node) bool {
-			if child == nil || child == n {
-				return true
-			}
-			if _, exists := parent[child]; !exists {
-				parent[child] = n
-			}
-			return true
-		})
-		return true
-	})
-
-	nodeFilter := []ast.Node{
-		(*ast.AssignStmt)(nil),
-	}
-
-	insp.Preorder(nodeFilter, func(n ast.Node) {
-		pos := pass.Fset.Position(n.Pos())
-		if ignoreTests && strings.HasSuffix(pos.Filename, "_test.go") {
+	insp.Preorder([]ast.Node{(*ast.AssignStmt)(nil)}, func(n ast.Node) {
+		if skipFile(pass, n) {
 			return
 		}
-
 		as, ok := n.(*ast.AssignStmt)
 		if !ok || as.Tok != token.DEFINE {
 			return
 		}
-
-		for _, lhs := range as.Lhs {
-
-			ident, ok := lhs.(*ast.Ident)
-			if !ok || ident.Name == "_" {
-				continue
-			}
-
-			obj := pass.TypesInfo.Defs[ident]
-			if obj == nil {
-				continue
-			}
-
-			outer := findOuter(pass.TypesInfo, ident, obj)
-			if outer == nil {
-				continue
-			}
-
-			stmt := findOwningStmt(as, parent)
-			if stmt == nil {
-				pass.Reportf(ident.Pos(),
-					"variable %q is redefined and shadows an outer %q",
-					ident.Name, ident.Name)
-				continue
-			}
-
-			block := findEnclosingBlock(stmt, parent)
-			if block == nil {
-				pass.Reportf(ident.Pos(),
-					"variable %q is redefined and shadows an outer %q",
-					ident.Name, ident.Name)
-				continue
-			}
-
-			if allowShortIf {
-				if _, ok := parent[as].(*ast.IfStmt); ok {
-					return
-				}
-			}
-
-			if allowSameLine {
-				if pass.Fset.Position(ident.Pos()).Line == pass.Fset.Position(outer.Pos()).Line {
-					return
-				}
-			}
-
-			if allowLoopShadow {
-				if _, ok := parent[stmt].(*ast.ForStmt); ok {
-					return
-				}
-				if _, ok := parent[stmt].(*ast.RangeStmt); ok {
-					return
-				}
-			}
-
-			if allowDeadOuter {
-				if !outerUsedLater(outer, stmt, block, pass.TypesInfo) {
-					return
-				}
-			}
-
-			if allowErrShadow {
-				if ident.Name == "err" && outer.Name() == "err" {
-					return
-				}
-			}
-
-			if allowGuardShadow {
-				if isGuardClauseOnly(outer, stmt, block, pass.TypesInfo) {
-					return
-				}
-			}
-
-			if allowTableTests {
-				if isTableTestPattern(as, parent, pass.TypesInfo) {
-					return
-				}
-			}
-
-			pass.Reportf(ident.Pos(),
-				"variable %q is redefined and shadows an outer %q",
-				ident.Name, ident.Name)
-		}
+		processAssign(pass, as, parent)
 	})
 
 	return nil, nil
 }
 
-// findOuter returns the nearest outer object with the same name.
+func buildParentMap(insp *inspector.Inspector) map[ast.Node]ast.Node {
+	parent := make(map[ast.Node]ast.Node)
+
+	insp.WithStack(nil, func(n ast.Node, push bool, stack []ast.Node) bool {
+		if push && len(stack) > 1 {
+			parent[n] = stack[len(stack)-2]
+		}
+		return true
+	})
+
+	return parent
+}
+
+func skipFile(pass *analysis.Pass, n ast.Node) (skip bool) {
+	if !ignoreTests {
+		pos := pass.Fset.Position(n.Pos())
+		skip = strings.HasSuffix(pos.Filename, "_test.go")
+	}
+
+	return
+}
+
+func processAssign(pass *analysis.Pass, as *ast.AssignStmt, parent map[ast.Node]ast.Node) {
+	for _, lhs := range as.Lhs {
+		ident, ok := lhs.(*ast.Ident)
+		if !ok || ident.Name == "_" {
+			continue
+		}
+
+		obj := pass.TypesInfo.Defs[ident]
+		if obj == nil {
+			continue
+		}
+		outer := findOuter(pass.TypesInfo, ident, obj)
+		if outer == nil {
+			continue
+		}
+		if shouldSkipShadow(pass, ident, outer, as, parent) {
+			continue
+		}
+		pass.Reportf(ident.Pos(),
+			"variable %q is redefined and shadows an outer %q",
+			ident.Name, ident.Name)
+	}
+}
+
+func shouldSkipShadow(
+	pass *analysis.Pass,
+	ident *ast.Ident,
+	outer types.Object,
+	as *ast.AssignStmt,
+	parent map[ast.Node]ast.Node,
+) (should bool) {
+	block := findEnclosingBlock(as, parent)
+	if block == nil {
+		return
+	}
+
+	stmt := findOwningStmt(as, parent)
+	if stmt == nil {
+		return
+	}
+
+	for _, should = range []bool{
+		skipForShortIf(parent, as),
+		skipForSameLine(pass, ident, outer),
+		skipForLoopShadow(parent, stmt),
+		skipForDeadOuter(pass, outer, stmt, block),
+		skipForErrShadow(ident, outer),
+		skipForGuardShadow(pass, outer, stmt, block),
+		skipForTableTests(as, parent, pass.TypesInfo),
+	} {
+		if should {
+			break
+		}
+	}
+
+	return
+}
+
+func skipForShortIf(parent map[ast.Node]ast.Node, as *ast.AssignStmt) bool {
+	_, ok := parent[as].(*ast.IfStmt)
+	return ok && allowShortIf
+}
+
+func skipForSameLine(pass *analysis.Pass, ident *ast.Ident, outer types.Object) bool {
+	return pass.Fset.Position(ident.Pos()).Line ==
+		pass.Fset.Position(outer.Pos()).Line && allowSameLine
+}
+
+func skipForLoopShadow(parent map[ast.Node]ast.Node, stmt ast.Stmt) (ok bool) {
+	if allowLoopShadow {
+		if _, ok = parent[stmt].(*ast.ForStmt); ok {
+			return
+		}
+		if _, ok = parent[stmt].(*ast.RangeStmt); ok {
+			return
+		}
+	}
+	return
+}
+
+func skipForDeadOuter(
+	pass *analysis.Pass,
+	outer types.Object,
+	stmt ast.Stmt,
+	block *ast.BlockStmt,
+) (allow bool) {
+	if allowDeadOuter {
+		allow = !outerUsedLater(outer, stmt, block, pass.TypesInfo) && allowDeadOuter
+	}
+
+	return
+}
+
+func skipForErrShadow(ident *ast.Ident, outer types.Object) (allow bool) {
+	if allowErrShadow {
+		allow = ident.Name == "err" && outer.Name() == "err"
+	}
+	return
+}
+
+func skipForGuardShadow(pass *analysis.Pass, outer types.Object, stmt ast.Stmt, block *ast.BlockStmt) bool {
+	return isGuardClauseOnly(outer, stmt, block, pass.TypesInfo) && allowGuardShadow
+}
+
+func skipForTableTests(as *ast.AssignStmt, parent map[ast.Node]ast.Node, info *types.Info) bool {
+	return isTableTestPattern(as, parent, info) && allowTableTests
+}
+
 func findOuter(info *types.Info, ident *ast.Ident, inner types.Object) types.Object {
+	name := ident.Name
 	scope := inner.Parent()
 	if scope == nil {
 		return nil
 	}
 
+	// Walk outward through lexical scopes
 	for s := scope.Parent(); s != nil; s = s.Parent() {
-		if obj := s.Lookup(ident.Name); obj != nil {
-			return obj
+		if obj := s.Lookup(name); obj != nil {
+			// Ensure it's a variable, not a func param, not a field, etc.
+			if _, ok := obj.(*types.Var); ok {
+				return obj
+			}
 		}
 	}
+
 	return nil
 }
 
 // findOwningStmt walks upward using the parent map until it finds an ast.Stmt.
-func findOwningStmt(n ast.Node, parent map[ast.Node]ast.Node) ast.Stmt {
+func findOwningStmt(n ast.Node, parent map[ast.Node]ast.Node) (s ast.Stmt) {
 	for cur := n; cur != nil; cur = parent[cur] {
-		if s, ok := cur.(ast.Stmt); ok {
-			return s
+		var ok bool
+		if s, ok = cur.(ast.Stmt); ok {
+			break
 		}
 	}
-	return nil
+	return
 }
 
 // findEnclosingBlock walks upward until it finds the nearest *ast.BlockStmt.
-func findEnclosingBlock(n ast.Node, parent map[ast.Node]ast.Node) *ast.BlockStmt {
+func findEnclosingBlock(n ast.Node, parent map[ast.Node]ast.Node) (b *ast.BlockStmt) {
 	for cur := n; cur != nil; cur = parent[cur] {
-		if b, ok := cur.(*ast.BlockStmt); ok {
-			return b
+		var ok bool
+		if b, ok = cur.(*ast.BlockStmt); ok {
+			break
 		}
 	}
-	return nil
+	return
 }
 
 // outerUsedLater reports whether the OUTER object is used in any statement
