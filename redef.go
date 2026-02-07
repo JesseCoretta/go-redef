@@ -175,12 +175,14 @@ func findOuter(info *types.Info, ident *ast.Ident, inner types.Object) types.Obj
 		return nil
 	}
 
-	// Walk outward through lexical scopes
 	for s := scope.Parent(); s != nil; s = s.Parent() {
 		if obj := s.Lookup(name); obj != nil {
-			// Ensure it's a variable, not a func param, not a field, etc.
-			if _, ok := obj.(*types.Var); ok {
-				return obj
+			if v, ok := obj.(*types.Var); ok {
+				// Only treat it as an outer variable if
+				// it appears earlier in the file.
+				if v.Pos() < ident.Pos() {
+					return v
+				}
 			}
 		}
 	}
