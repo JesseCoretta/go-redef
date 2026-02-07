@@ -327,8 +327,8 @@ func isGuardClauseOnly(outer types.Object, stmt ast.Stmt, block *ast.BlockStmt, 
 			// Condition must reference outer
 			condUsesOuter := false
 			ast.Inspect(ifs.Cond, func(n ast.Node) bool {
-				id, ok := n.(*ast.Ident)
-				if ok && info.Uses[id] == outer {
+				id, assert := n.(*ast.Ident)
+				if assert && info.Uses[id] == outer {
 					condUsesOuter = true
 					return false
 				}
