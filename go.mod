@@ -1,6 +1,6 @@
 module github.com/JesseCoretta/go-redef
 
-go 1.25
+go 1.25.5
 
 require golang.org/x/tools v0.41.0
 
