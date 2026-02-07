@@ -1,0 +1,1 @@
+code.go:12:9: variable "err" is redefined and shadows an outer "err"

@@ -91,23 +91,36 @@ func shouldSkipShadow(
 	as *ast.AssignStmt,
 	parent map[ast.Node]ast.Node,
 ) (should bool) {
+	// nearest block (may be inner block, e.g., if body)
 	block := findEnclosingBlock(as, parent)
 	if block == nil {
 		return
 	}
 
+	// immediate owning statement (may be the AssignStmt itself, or an ExprStmt, etc.)
 	stmt := findOwningStmt(as, parent)
 	if stmt == nil {
 		return
 	}
 
+	// function body block and the top-level statement inside that function body
+	funcBody := findFuncBody(as, parent)
+	topStmt := stmt
+	if funcBody != nil {
+		topStmt = findTopLevelStmt(stmt, parent, funcBody)
+	}
+
+	// Evaluate skip checks. For the checks that need the function-level
+	// context (dead-outer and guard-only), pass topStmt and funcBody.
 	for _, should = range []bool{
 		skipForShortIf(parent, as),
 		skipForSameLine(pass, ident, outer),
 		skipForLoopShadow(parent, stmt),
-		skipForDeadOuter(pass, outer, stmt, block),
+		// use topStmt and funcBody for dead-outer detection
+		skipForDeadOuter(pass, outer, topStmt, funcBody),
 		skipForErrShadow(ident, outer),
-		skipForGuardShadow(pass, outer, stmt, block),
+		// use topStmt and funcBody for guard-only detection
+		skipForGuardShadow(pass, outer, topStmt, funcBody),
 		skipForTableTests(as, parent, pass.TypesInfo),
 	} {
 		if should {
@@ -188,6 +201,40 @@ func findOuter(info *types.Info, ident *ast.Ident, inner types.Object) types.Obj
 	}
 
 	return nil
+}
+
+// findFuncBody walks parents until it finds the function body BlockStmt
+// (either from a FuncDecl or a FuncLit). Returns nil if not found.
+func findFuncBody(n ast.Node, parent map[ast.Node]ast.Node) *ast.BlockStmt {
+	for cur := n; cur != nil; cur = parent[cur] {
+		p := parent[cur]
+		switch fn := p.(type) {
+		case *ast.FuncDecl:
+			return fn.Body
+		case *ast.FuncLit:
+			return fn.Body
+		}
+	}
+	return nil
+}
+
+// findTopLevelStmt returns the statement that is a direct child of block
+// and that is an ancestor of stmt. If none is found, returns stmt.
+func findTopLevelStmt(stmt ast.Stmt, parent map[ast.Node]ast.Node, block *ast.BlockStmt) ast.Stmt {
+	if block == nil || stmt == nil {
+		return stmt
+	}
+	for cur := ast.Node(stmt); cur != nil; cur = parent[cur] {
+		// If the parent of cur is the block, then cur is the direct child
+		// of block that contains stmt. Return cur if it is an ast.Stmt.
+		if parent[cur] == block {
+			if s, ok := cur.(ast.Stmt); ok {
+				return s
+			}
+			break
+		}
+	}
+	return stmt
 }
 
 // findOwningStmt walks upward using the parent map until it finds an ast.Stmt.
@@ -299,66 +346,76 @@ func isTableTestPattern(as *ast.AssignStmt, parent map[ast.Node]ast.Node, info *
 }
 
 func isGuardClauseOnly(outer types.Object, stmt ast.Stmt, block *ast.BlockStmt, info *types.Info) bool {
-	if block == nil {
+	if block == nil || stmt == nil {
 		return false
 	}
 
-	// Scan all statements BEFORE the shadowing stmt
 	for _, s := range block.List {
 		if s == stmt {
 			break
 		}
-
-		// Look for uses of outer
-		used := false
-		ast.Inspect(s, func(n ast.Node) bool {
-			id, ok := n.(*ast.Ident)
-			if ok && info.Uses[id] == outer {
-				used = true
-				return false
-			}
-			return true
-		})
-
-		if !used {
+		if !stmtUsesOuter(s, outer, info) {
 			continue
 		}
-
-		// If used, it must be inside an if-statement guard
-		if ifs, ok := s.(*ast.IfStmt); ok {
-			// Condition must reference outer
-			condUsesOuter := false
-			ast.Inspect(ifs.Cond, func(n ast.Node) bool {
-				id, assert := n.(*ast.Ident)
-				if assert && info.Uses[id] == outer {
-					condUsesOuter = true
-					return false
-				}
-				return true
-			})
-
-			if !condUsesOuter {
-				return false
-			}
-
-			// Body must immediately return/break/continue
-			if len(ifs.Body.List) == 0 {
-				return false
-			}
-
-			switch ifs.Body.List[0].(type) {
-			case *ast.ReturnStmt, *ast.BranchStmt:
-				continue
-			default:
-				return false
-			}
-		} else {
-			// Used outside an if-guard; not a guard-only pattern
+		if !isValidGuardIf(s, outer, info) {
 			return false
 		}
 	}
 
 	return true
+}
+
+func stmtUsesOuter(s ast.Stmt, outer types.Object, info *types.Info) bool {
+	used := false
+	ast.Inspect(s, func(n ast.Node) bool {
+		id, ok := n.(*ast.Ident)
+		if ok && info.Uses[id] == outer {
+			used = true
+			return false
+		}
+		return true
+	})
+	return used
+}
+
+func isValidGuardIf(s ast.Stmt, outer types.Object, info *types.Info) bool {
+	ifs, ok := s.(*ast.IfStmt)
+	if !ok {
+		return false
+	}
+	if ifs.Else != nil {
+		return false
+	}
+	if !condUsesOuterOnly(ifs.Cond, outer, info) {
+		return false
+	}
+	return hasValidGuardBody(ifs.Body, outer, info)
+}
+
+func condUsesOuterOnly(cond ast.Expr, outer types.Object, info *types.Info) bool {
+	found := false
+	ast.Inspect(cond, func(n ast.Node) bool {
+		id, ok := n.(*ast.Ident)
+		if ok && info.Uses[id] == outer {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func hasValidGuardBody(body *ast.BlockStmt, outer types.Object, info *types.Info) bool {
+	if len(body.List) != 1 {
+		return false
+	}
+
+	switch b := body.List[0].(type) {
+	case *ast.ReturnStmt, *ast.BranchStmt:
+		return !stmtUsesOuter(b, outer, info)
+	default:
+		return false
+	}
 }
 
 // flag vars

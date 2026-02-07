@@ -1,0 +1,2 @@
+d.go:6:9: variable "err" is redefined and shadows an outer "err"
+

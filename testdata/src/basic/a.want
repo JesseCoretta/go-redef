@@ -1,0 +1,1 @@
+a.go:6:5: variable "x" is redefined and shadows an outer "x"
